@@ -1,0 +1,11 @@
+{
+    "load_calibration_factor": 1.0,
+    "disp_calibration_factor": 1.1,
+    "motor_jog_velocity_rpm": 40.0,
+    "pullback_speed_rpm": 60.0,
+    "break_disp_delta_threshold": 0.5,
+    "break_arm_threshold": 20.0,
+    "break_drop_fraction": 0.4,
+    "break_action_mode": 0,
+    "pullback_distance_mm": 5.0
+}
