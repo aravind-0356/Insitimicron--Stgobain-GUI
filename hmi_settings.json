@@ -1,0 +1,6 @@
+{
+    "load_calibration_factor": 1.0,
+    "disp_calibration_factor": 1.0,
+    "break_arm_threshold": 20.0,
+    "break_drop_fraction": 0.4
+}

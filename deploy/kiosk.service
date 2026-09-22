@@ -1,0 +1,25 @@
+[Unit]
+Description=PySide6 Kiosk GUI
+After=systemd-user-sessions.service network.target sound.target
+RequiresMountsFor=/mnt/data
+
+[Service]
+User=insitumicron-rpi
+Group=insitumicron-rpi
+PAMName=login
+StandardInput=tty
+TTYPath=/dev/tty7
+WorkingDirectory=/home/insitumicron-rpi/Pi_HMI
+Environment="QT_QPA_PLATFORM=wayland"
+Environment="KIOSK_MODE=1"
+Environment="XDG_RUNTIME_DIR=/run/user/1000"
+# Launch Cage and pass the python app as its child
+ExecStart=/usr/bin/cage -s -- /home/insitumicron-rpi/Pi_HMI/venv/bin/python main.py
+
+# Infinite Restart Configuration
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
