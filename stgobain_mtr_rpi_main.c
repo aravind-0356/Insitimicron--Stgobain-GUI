@@ -45,12 +45,11 @@
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c2;
 
-DMA_HandleTypeDef hdma_usart1_rx;   /* DMA handle for USART1 RX (added for encoder) */
-
 UART_HandleTypeDef huart5;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
 // Holding Registers (4x) - Numerical Data
@@ -77,16 +76,17 @@ float eurotherm_temp = 0.0f;
 /* ======================================================== */
 /* 3. UART RX BUFFERS (For Interrupts)                      */
 /* ======================================================== */
-// UART2 (Raspberry Pi) Command Buffer
-char uart2_rx_buffer[64];
-uint8_t uart2_rx_index = 0;
+// UART2 (Raspberry Pi) Command Ring Buffer
+#define UART2_RING_SIZE 256
+volatile char uart2_rx_ring[UART2_RING_SIZE];
+volatile uint16_t uart2_ring_head = 0;
+volatile uint16_t uart2_ring_tail = 0;
 uint8_t uart2_rx_byte;
-bool new_pi_command = false;
 
 // MicroEpsilon Sensor Variables (Robust Polling)
 static float scaled_val = 0.0f;
 static float unscaled_val = 0.0f;
-static float me_tare_offset = 0.0f; // Tare baseline for fully relaxed position
+static float me_tare_offset = -6.0f; // Tare baseline for fully relaxed position (-6mm offsets to 0mm)
 static uint32_t last_me_req_tick = 0;
 static uint8_t sensor_rx_buffer[256];
 static uint16_t sensor_rx_index = 0;
@@ -149,16 +149,17 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART2_UART_Init(void);
-static void MX_I2C2_Init(void);
 static void MX_UART5_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_I2C2_Init(void);
 /* USER CODE BEGIN PFP */
 void Process_Pi_Commands(void);
 void Process_Motor(void);
 void Process_Eurotherm(void);
 void Process_Sensor(void);
 void Process_Encoder(void);
+void Process_Motor_TX_Queue(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -185,16 +186,50 @@ void append_crc(uint8_t *frame, uint16_t len) {
   frame[len + 1] = (crc >> 8);
 }
 
-// Use blocking transmit for motor commands so back-to-back frames don't collide.
-// Sets encoder_bus_busy so the encoder poller does not fire mid-sequence.
+// NON-BLOCKING MOTOR COMMAND QUEUE
+#define MOTOR_TX_QUEUE_SIZE 16
+static uint8_t motor_tx_queue[MOTOR_TX_QUEUE_SIZE][8];
+static uint8_t motor_tx_head = 0;
+static uint8_t motor_tx_tail = 0;
+static uint32_t last_motor_tx_tick = 0;
+static uint8_t motor_is_txing = 0;
+
+// Enqueue the motor frame instantly and return (Non-Blocking)
 void modbus_send_motor(uint8_t *frame, uint16_t len) {
-  encoder_bus_busy = 1;
-  HAL_UART_Transmit(&huart1, frame, len, 100);
-  HAL_Delay(5); // Modbus inter-frame gap: allow slave to process
-  // FC06 write commands return an echo (8 bytes). The DMA callback will capture
-  // it, see Size != 9, and release the bus. We also release here as a safety
-  // net in case the echo never arrives (cable issue, etc.).
-  encoder_bus_busy = 0;
+    if ((motor_tx_head + 1) % MOTOR_TX_QUEUE_SIZE != motor_tx_tail) {
+        memcpy(motor_tx_queue[motor_tx_head], frame, len); // len is 8
+        motor_tx_head = (motor_tx_head + 1) % MOTOR_TX_QUEUE_SIZE;
+    }
+}
+
+// Background state machine to process motor queue with 5ms delays
+void Process_Motor_TX_Queue(void) {
+    uint32_t tick = HAL_GetTick();
+    
+    // If there are frames waiting to be sent
+    if (motor_tx_head != motor_tx_tail) {
+        // If the bus is completely free, claim it for the motor queue
+        if (!encoder_bus_busy && !motor_is_txing) {
+            encoder_bus_busy = 1;
+            motor_is_txing = 1;
+        }
+        
+        // If we own the bus, send the next frame with a 5ms gap
+        if (motor_is_txing) {
+            if (tick - last_motor_tx_tick >= 5) {
+                // Non-blocking IT transmit. Memory is static (in the queue), so it's safe!
+                HAL_UART_Transmit_IT(&huart1, motor_tx_queue[motor_tx_tail], 8);
+                motor_tx_tail = (motor_tx_tail + 1) % MOTOR_TX_QUEUE_SIZE;
+                last_motor_tx_tick = tick;
+            }
+        }
+    } else {
+        // Queue is empty. Release the bus safely after the last frame has had 5ms to settle.
+        if (motor_is_txing && (tick - last_motor_tx_tick >= 5)) {
+            motor_is_txing = 0;
+            encoder_bus_busy = 0;
+        }
+    }
 }
 
 // ---------------------------------------------------------
@@ -266,32 +301,57 @@ void Leadshine_Send_Start(int16_t vel) {
 void Leadshine_Send_Stop(void) {
     uint8_t frame[8];
 
+    // FLUSH the queue: Erase any pending Start commands so they don't fire after we Stop
+    motor_tx_head = motor_tx_tail;
+
     // Write Quick Stop to PR Control Register 0x6002 = 0x0040
     // Manual section 5.3.3: "Write value 0x040 to 0x6002 = E-stop"
     uint8_t f_stop[6] = {0x01, 0x06, 0x60, 0x02, 0x00, 0x40};
-    memcpy(frame, f_stop, 6); append_crc(frame, 6); modbus_send_motor(frame, 8);
-    DBG_PRINT("DBG: STOP frame sent -> 0x6002=0x0040 (Quick Stop)\r\n");
+    memcpy(frame, f_stop, 6); append_crc(frame, 6); 
+    
+    // BURST STOP: The Leadshine drive often ignores Modbus commands if it is currently 
+    // busy calculating acceleration curves from a Start command received just milliseconds prior.
+    // By spamming the Stop command 4 times (spanning 20ms), we guarantee the drive catches it.
+    modbus_send_motor(frame, 8);
+    modbus_send_motor(frame, 8);
+    modbus_send_motor(frame, 8);
+    modbus_send_motor(frame, 8);
+    
+    DBG_PRINT("DBG: STOP burst sent -> 0x6002=0x0040 (Quick Stop)\r\n");
 }
 
+
+// ---------------------------------------------------------
+// ---------------------------------------------------------
+// UART ERROR CALLBACK: Clears UART3 errors and restarts reception.
+// At 256000 baud with Even parity, overrun/parity errors can occur.
+// Without this, a single error silently kills HAL_UART_Receive_IT,
+// freezing the sensor buffer permanently.
+// ---------------------------------------------------------
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART3) {
+        // Clear all UART3 error flags
+        __HAL_UART_CLEAR_OREFLAG(huart);
+        __HAL_UART_CLEAR_NEFLAG(huart);
+        __HAL_UART_CLEAR_FEFLAG(huart);
+        __HAL_UART_CLEAR_PEFLAG(huart);
+        sensor_state = 0; // Reset sensor state machine
+        HAL_UART_Receive_IT(&huart3, &sensor_rx_byte, 1); // Restart reception
+    }
+}
 
 // ---------------------------------------------------------
 // HARDWARE INTERRUPT: Triggers every time a single byte arrives (IT mode)
 // Note: USART1 RX is handled separately via DMA+Idle callback below.
 // ---------------------------------------------------------
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+
 {
     if (huart->Instance == USART2) {
-        // Handle incoming character from Raspberry Pi
-        if (uart2_rx_byte == '\n' || uart2_rx_byte == '\r') {
-            uart2_rx_buffer[uart2_rx_index] = '\0';
-            if (uart2_rx_index > 0) {
-                new_pi_command = true;
-            }
-        } else {
-            if (uart2_rx_index < sizeof(uart2_rx_buffer) - 1) {
-                uart2_rx_buffer[uart2_rx_index++] = uart2_rx_byte;
-            }
-        }
+        // Push incoming character to ring buffer
+        uart2_rx_ring[uart2_ring_head] = uart2_rx_byte;
+        uart2_ring_head = (uart2_ring_head + 1) % UART2_RING_SIZE;
         // Re-arm interrupt
         HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1);
     }
@@ -345,80 +405,95 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 // FOREGROUND TASKS
 // ---------------------------------------------------------
 void Process_Pi_Commands(void) {
-    if (new_pi_command) {
+    static char cmd_buf[64];
+    static uint8_t cmd_idx = 0;
 
-        if (strncmp(uart2_rx_buffer, "Start", 5) == 0) {
-            pi_cmd_start    = true;
-            pi_cmd_stop     = false;
-            pi_cmd_pullback = false;
-            DBG_PRINT("DBG: CMD=Start -> pi_cmd_start set\r\n");
-        }
-        else if (strncmp(uart2_rx_buffer, "Stop", 4) == 0) {
-            pi_cmd_stop     = true;
-            pi_cmd_start    = false;
-            pi_cmd_pullback = false;
-            DBG_PRINT("DBG: CMD=Stop -> pi_cmd_stop set\r\n");
-        }
-        else if (strncmp(uart2_rx_buffer, "JogUp", 5) == 0) {
-            pi_cmd_start    = true;
-            pi_cmd_stop     = false;
-            pi_cmd_pullback = false;
-            motor_speed_setpoint = abs(motor_speed_setpoint); // CW direction
-            DBG_PRINT("DBG: CMD=JogUp -> pi_cmd_start set\r\n");
-        }
-        else if (strncmp(uart2_rx_buffer, "JogDown", 7) == 0) {
-            pi_cmd_start    = true;
-            pi_cmd_stop     = false;
-            pi_cmd_pullback = false;
-            motor_speed_setpoint = -abs(motor_speed_setpoint); // CCW direction
-            DBG_PRINT("DBG: CMD=JogDown -> pi_cmd_start set (reverse)\r\n");
-        }
-        else if (strncmp(uart2_rx_buffer, "Vel:", 4) == 0) {
-            int speed = atoi(&uart2_rx_buffer[4]);
-            if (speed != 0) {
-                motor_speed_setpoint = (int16_t)speed;
-                char dbg[48];
-                int len = snprintf(dbg, sizeof(dbg), "DBG: CMD=Vel -> setpoint=%d RPM\r\n", motor_speed_setpoint);
-                HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 20);
-            } else {
-                DBG_PRINT("DBG: CMD=Vel -> IGNORED (speed=0)\r\n");
-            }
-        }
-        else if (strncmp(uart2_rx_buffer, "Pullback:", 9) == 0) {
-            int32_t counts = (int32_t)atoi(&uart2_rx_buffer[9]);
-            if (counts > 0) {
-                pullback_target_counts = counts;
-                pi_cmd_pullback        = true;
-                pi_cmd_start           = false;
-                pi_cmd_stop            = false;
-                char dbg[56];
-                int len = snprintf(dbg, sizeof(dbg), "DBG: CMD=Pullback -> counts=%ld\r\n", (long)counts);
-                HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 20);
-            } else {
-                DBG_PRINT("DBG: CMD=Pullback -> IGNORED (counts<=0)\r\n");
-            }
-        }
-        else if (strncmp(uart2_rx_buffer, "PullSpeed:", 10) == 0) {
-            int spd = atoi(&uart2_rx_buffer[10]);
-            if (spd > 0 && spd <= 200) {
-                pullback_speed_rpm = (int16_t)spd;
-                char dbg[48];
-                int len = snprintf(dbg, sizeof(dbg), "DBG: CMD=PullSpeed -> %d RPM\r\n", spd);
-                HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 20);
-            } else {
-                DBG_PRINT("DBG: CMD=PullSpeed -> IGNORED (out of range)\r\n");
-            }
-        }
-        else {
-            /* Unknown command — echo it back so you can see what arrived */
-            char dbg[72];
-            int len = snprintf(dbg, sizeof(dbg), "DBG: CMD=UNKNOWN [%s]\r\n", uart2_rx_buffer);
-            HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 20);
-        }
+    // Process all available characters in the ring buffer
+    while (uart2_ring_tail != uart2_ring_head) {
+        char c = uart2_rx_ring[uart2_ring_tail];
+        uart2_ring_tail = (uart2_ring_tail + 1) % UART2_RING_SIZE;
 
-        uart2_rx_index = 0;
-        memset(uart2_rx_buffer, 0, sizeof(uart2_rx_buffer));
-        new_pi_command = false;
+        if (c == '\n' || c == '\r') {
+            cmd_buf[cmd_idx] = '\0'; // Null-terminate the command
+            if (cmd_idx > 0) {
+                // We have a complete command, process it immediately
+                if (strncmp(cmd_buf, "Start", 5) == 0) {
+                    pi_cmd_start    = true;
+                    pi_cmd_stop     = false;
+                    pi_cmd_pullback = false;
+                    DBG_PRINT("DBG: CMD=Start -> pi_cmd_start set\r\n");
+                }
+                else if (strncmp(cmd_buf, "Stop", 4) == 0) {
+                    pi_cmd_stop     = true;
+                    pi_cmd_start    = false;
+                    pi_cmd_pullback = false;
+                    DBG_PRINT("DBG: CMD=Stop -> pi_cmd_stop set\r\n");
+                }
+                else if (strncmp(cmd_buf, "JogUp", 5) == 0) {
+                    pi_cmd_start    = true;
+                    pi_cmd_stop     = false;
+                    pi_cmd_pullback = false;
+                    motor_speed_setpoint = abs(motor_speed_setpoint); // CW direction
+                    DBG_PRINT("DBG: CMD=JogUp -> pi_cmd_start set\r\n");
+                }
+                else if (strncmp(cmd_buf, "JogDown", 7) == 0) {
+                    pi_cmd_start    = true;
+                    pi_cmd_stop     = false;
+                    pi_cmd_pullback = false;
+                    motor_speed_setpoint = -abs(motor_speed_setpoint); // CCW direction
+                    DBG_PRINT("DBG: CMD=JogDown -> pi_cmd_start set (reverse)\r\n");
+                }
+                else if (strncmp(cmd_buf, "Vel:", 4) == 0) {
+                    int speed = atoi(&cmd_buf[4]);
+                    if (speed != 0) {
+                        motor_speed_setpoint = (int16_t)speed;
+                        char dbg[48];
+                        int len = snprintf(dbg, sizeof(dbg), "DBG: CMD=Vel -> setpoint=%d RPM\r\n", motor_speed_setpoint);
+                        HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 20);
+                    } else {
+                        DBG_PRINT("DBG: CMD=Vel -> IGNORED (speed=0)\r\n");
+                    }
+                }
+                else if (strncmp(cmd_buf, "Pullback:", 9) == 0) {
+                    int32_t counts = (int32_t)atoi(&cmd_buf[9]);
+                    if (counts > 0) {
+                        pullback_target_counts = counts;
+                        pi_cmd_pullback        = true;
+                        pi_cmd_start           = false;
+                        pi_cmd_stop            = false;
+                        char dbg[56];
+                        int len = snprintf(dbg, sizeof(dbg), "DBG: CMD=Pullback -> counts=%ld\r\n", (long)counts);
+                        HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 20);
+                    } else {
+                        DBG_PRINT("DBG: CMD=Pullback -> IGNORED (counts<=0)\r\n");
+                    }
+                }
+                else if (strncmp(cmd_buf, "PullSpeed:", 10) == 0) {
+                    int spd = atoi(&cmd_buf[10]);
+                    if (spd > 0 && spd <= 200) {
+                        pullback_speed_rpm = (int16_t)spd;
+                        char dbg[48];
+                        int len = snprintf(dbg, sizeof(dbg), "DBG: CMD=PullSpeed -> %d RPM\r\n", spd);
+                        HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 20);
+                    } else {
+                        DBG_PRINT("DBG: CMD=PullSpeed -> IGNORED (out of range)\r\n");
+                    }
+                }
+                else {
+                    /* Unknown command */
+                    char dbg[72];
+                    int len = snprintf(dbg, sizeof(dbg), "DBG: CMD=UNKNOWN [%s]\r\n", cmd_buf);
+                    HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 20);
+                }
+
+                cmd_idx = 0; // Reset index for the next command
+            }
+        } else {
+            // Append character to the local command buffer
+            if (cmd_idx < sizeof(cmd_buf) - 1) {
+                cmd_buf[cmd_idx++] = c;
+            }
+        }
     }
 }
 
@@ -431,9 +506,9 @@ void Process_Motor(void) {
      * randomly read GPIO_PIN_RESET, blocking all motor commands.
      * FIX (software): Enable the internal pull-up for GPIOB Pin 5 in
      * MX_GPIO_Init() by setting GPIO_PULLUP in the GPIO_InitStruct.
-     * FIX (hardware): Wire a 10kΩ resistor from GPIOB Pin 5 to 3.3V. 
-     * 
-     * TEMPORARILY DISABLED FOR DEBUGGING: 
+     * FIX (hardware): Wire a 10kΩ resistor from GPIOB Pin 5 to 3.3V.
+     *
+     * TEMPORARILY DISABLED FOR DEBUGGING:
      */
     /*
     if (HAL_GPIO_ReadPin(KILL_SWITCH_Port, KILL_SWITCH_Pin) == GPIO_PIN_RESET) {
@@ -521,12 +596,13 @@ void Process_Eurotherm(void) {
         // Poll every 500ms
         if (current_tick - last_eurotherm_poll >= 500) {
             // Modbus Read Holding Registers: Slave 1, Func 3, Addr 1, 1 Register
-            uint8_t req[8] = {0x01, 0x03, 0x00, 0x01, 0x00, 0x01, 0, 0};
+            // FIX: Made static (fixes the stack bug) and using non-blocking IT transmit
+            static uint8_t req[8] = {0x01, 0x03, 0x00, 0x01, 0x00, 0x01, 0, 0};
             uint16_t crc = modbus_crc(req, 6);
             req[6] = crc & 0xFF;
             req[7] = (crc >> 8) & 0xFF;
             eurotherm_rx_index = 0;
-            HAL_UART_Transmit_IT(&huart5, req, 8);
+            HAL_UART_Transmit_IT(&huart5, req, 8); // Non-blocking transmit
             last_eurotherm_poll = current_tick;
             eurotherm_state = 1;
         }
@@ -534,17 +610,18 @@ void Process_Eurotherm(void) {
     else if (eurotherm_state == 1) {
         // Check for idle line to indicate end of response
         if (eurotherm_rx_index > 0 && eurotherm_rx_index == last_eurotherm_rx_index) {
-            if (eurotherm_rx_index >= 7 && eurotherm_rx_buffer[0] == 0x01 && eurotherm_rx_buffer[1] == 0x03) {
+            // Check SlaveID (0x01), Func (0x03), and ByteCount (0x02) to ignore TX echoes
+            if (eurotherm_rx_index >= 7 && eurotherm_rx_buffer[0] == 0x01 && eurotherm_rx_buffer[1] == 0x03 && eurotherm_rx_buffer[2] == 0x02) {
                 uint16_t received_crc = (eurotherm_rx_buffer[eurotherm_rx_index - 1] << 8) | eurotherm_rx_buffer[eurotherm_rx_index - 2];
                 uint16_t calculated_crc = modbus_crc(eurotherm_rx_buffer, eurotherm_rx_index - 2);
 
                 if (received_crc == calculated_crc) {
                     int16_t raw_temp = (eurotherm_rx_buffer[3] << 8) | eurotherm_rx_buffer[4];
-                    eurotherm_temp = (float)raw_temp / 10.0f; // Assume 1 decimal place
+                    eurotherm_temp = (float)raw_temp; // Match python script: 0 decimal places
                 }
             }
             eurotherm_state = 0; // Go back to poll
-        } else if (current_tick - last_eurotherm_poll >= 100) { // 100ms timeout
+        } else if (current_tick - last_eurotherm_poll >= 250) { // 250ms timeout (increased for 9600 baud)
             eurotherm_state = 0;
         }
     }
@@ -552,67 +629,52 @@ void Process_Eurotherm(void) {
 }
 
 void Process_Sensor(void) {
-    // Process any complete frames in the buffer
-    while (sensor_rx_index >= 17) {
-        int frame_start = -1;
-        for (int i = 0; i <= sensor_rx_index - 17; i++) {
-            if (sensor_rx_buffer[i] == 0x68 && sensor_rx_buffer[i+1] == 0x0B &&
-                sensor_rx_buffer[i+2] == 0x0B && sensor_rx_buffer[i+3] == 0x68 &&
-                sensor_rx_buffer[i+16] == 0x16) {
-                frame_start = i;
-                break;
-            }
-        }
-
-        if (frame_start >= 0) {
-            uint8_t sum = 0;
-            for (int j = 4; j <= 14; j++) {
-                sum += sensor_rx_buffer[frame_start + j];
-            }
-            if (sum == sensor_rx_buffer[frame_start + 15]) {
-                memcpy(&unscaled_val, &sensor_rx_buffer[frame_start + 7], 4);
-                memcpy(&scaled_val, &sensor_rx_buffer[frame_start + 11], 4);
-                raw_displacement = scaled_val;
-                tared_displacement = scaled_val - me_tare_offset;
-            } else {
-                DBG_PRINT("DBG: Sensor Checksum Error\r\n");
-            }
-            
-            // Print raw bytes strictly if it hits -6.0 to debug sensor state
-            if (scaled_val == -6.0f) {
-                char dbg[64];
-                int len = snprintf(dbg, sizeof(dbg), "DBG: SENS RAW %02X %02X %02X %02X -> %.3f\r\n",
-                                   sensor_rx_buffer[frame_start+11], sensor_rx_buffer[frame_start+12],
-                                   sensor_rx_buffer[frame_start+13], sensor_rx_buffer[frame_start+14],
-                                   scaled_val);
-                HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 20);
-            }
-
-            // Safely remove parsed frame from buffer
-            int bytes_to_remove = frame_start + 17;
-            HAL_NVIC_DisableIRQ(USART3_IRQn);
-            memmove(sensor_rx_buffer, sensor_rx_buffer + bytes_to_remove, sensor_rx_index - bytes_to_remove);
-            sensor_rx_index -= bytes_to_remove;
-            HAL_NVIC_EnableIRQ(USART3_IRQn);
-        } else {
-            // No valid frame found in current buffer. If it's getting full, clear garbage.
-            if (sensor_rx_index > 100) {
-                int bytes_to_remove = sensor_rx_index - 16;
-                HAL_NVIC_DisableIRQ(USART3_IRQn);
-                memmove(sensor_rx_buffer, sensor_rx_buffer + bytes_to_remove, sensor_rx_index - bytes_to_remove);
-                sensor_rx_index -= bytes_to_remove;
-                HAL_NVIC_EnableIRQ(USART3_IRQn);
+    uint32_t tick = HAL_GetTick();
+    switch (sensor_state) {
+        case 0: { // Request
+            if (tick - last_me_req_tick >= 50) { // 20Hz = 50ms period
+                // FIX: Made static to avoid stack corruption.
+                // Using non-blocking IT transmit as requested.
+                static uint8_t req[] = {0x10, 0x7E, 0x01, 0x4C, 0xCB, 0x16};
+                sensor_rx_index = 0; // Clear the buffer for a fresh response
+                
+                HAL_UART_Transmit_IT(&huart3, req, 6); // Non-blocking transmit
+                
+                last_me_req_tick = tick;
+                sensor_state = 1;
             }
             break;
         }
-    }
+        case 1: { // Wait response
+            if (sensor_rx_index >= 17) {
+                // Search for the start pattern 0x68 0x0B 0x0B 0x68 and stop byte 0x16
+                for (int i = 0; i <= sensor_rx_index - 17; i++) {
+                    if (sensor_rx_buffer[i] == 0x68 && sensor_rx_buffer[i+1] == 0x0B &&
+                        sensor_rx_buffer[i+2] == 0x0B && sensor_rx_buffer[i+3] == 0x68 &&
+                        sensor_rx_buffer[i+16] == 0x16) {
 
-    // Keep polling just in case it is NOT in continuous mode
-    uint32_t tick = HAL_GetTick();
-    if (tick - last_me_req_tick >= 50) { // 20Hz
-        uint8_t req[] = {0x10, 0x7E, 0x01, 0x4C, 0xCB, 0x16};
-        HAL_UART_Transmit_IT(&huart3, req, 6);
-        last_me_req_tick = tick;
+                        uint8_t sum = 0;
+                        for (int j = 4; j <= 14; j++) {
+                            sum += sensor_rx_buffer[i+j];
+                        }
+                        if (sum == sensor_rx_buffer[i+15]) {
+                            // Valid checksum! Extract floats
+                            memcpy(&unscaled_val, &sensor_rx_buffer[i+7], 4);
+                            memcpy(&scaled_val, &sensor_rx_buffer[i+11], 4);
+
+                            // Immediately compute tared displacement for telemetry
+                            raw_displacement = scaled_val;
+                            tared_displacement = scaled_val - me_tare_offset;
+                        }
+                        break; // Stop scanning once we find the packet
+                    }
+                }
+                sensor_state = 0; // ready for next request
+            } else if (tick - last_me_req_tick >= 45) { // Timeout
+                sensor_state = 0;
+            }
+            break;
+        }
     }
 }
 
@@ -672,12 +734,12 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_DMA_Init();            /* DMA MUST be initialised before USART1 */
+  MX_DMA_Init();
   MX_USART2_UART_Init();
-  MX_I2C2_Init();
   MX_UART5_Init();
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
+  MX_I2C2_Init();
   /* USER CODE BEGIN 2 */
   // Arm the non-blocking UART Receive Interrupts
   HAL_UART_Receive_IT(&huart2, &uart2_rx_byte, 1);    // Listen to Pi
@@ -716,6 +778,7 @@ int main(void)
 	  Process_Eurotherm();
 	  Process_Sensor();    // Internal timings (20 Hz)
 	  Process_Encoder();   // Non-blocking encoder poll (20 Hz, bus-arbitrated)
+	  Process_Motor_TX_Queue(); // Non-blocking motor Modbus queue
 
 	  // Clear diagnostic flags in main loop (not in ISR to avoid race)
 	  if (g_enc_crc_fail) {
@@ -834,9 +897,9 @@ static void MX_UART5_Init(void)
 
   /* USER CODE END UART5_Init 1 */
   huart5.Instance = UART5;
-  huart5.Init.BaudRate = 115200;
+  huart5.Init.BaudRate = 9600;
   huart5.Init.WordLength = UART_WORDLENGTH_8B;
-  huart5.Init.StopBits = UART_STOPBITS_1;
+  huart5.Init.StopBits = UART_STOPBITS_2;
   huart5.Init.Parity = UART_PARITY_NONE;
   huart5.Init.Mode = UART_MODE_TX_RX;
   huart5.Init.HwFlowCtl = UART_HWCONTROL_NONE;
@@ -965,8 +1028,6 @@ static void MX_DMA_Init(void)
   HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
 
 }
-
-
 
 /**
   * @brief GPIO Initialization Function

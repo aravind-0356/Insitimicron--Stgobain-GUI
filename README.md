@@ -44,7 +44,6 @@ The **InsituMicron Motor Control HMI** is a dedicated PySide6 (Qt6) interface bu
 ├── virtual_keyboard.py         # On-screen touch alphanumeric keyboard and numpad
 ├── theme.py / constants.py     # Dark industrial theme and UI styling
 ├── stgobain_mtr_rpi_main.c     # STM32 Nucleo firmware for motor communication
-├── encoder_refer_main.c        # Encoder reference routines
 ├── test_init.py                # Hardware initialization and self-test routine
 ├── requirements.txt            # Python dependencies
 ├── CS2RS_Series_User_Manual_V1.5.pdf # Leadshine Stepper Driver manual
