@@ -2,7 +2,7 @@
 
 ![InsituMicron Logo](InsituMicronlogo.jpg)
 
-**Branch:** `main`  
+**Branch:** `St-gobain-lc`  
 **Target Platform:** Raspberry Pi 5 (Touchscreen Kiosk) + STM32 Nucleo (F446RE)  
 **Application:** 3-Point Flexural Bend Testing & Real-Time DAQ for Ceramic / Glass Samples
 
@@ -44,7 +44,7 @@ The **InsituMicron Load Cell HMI** is an industrial-grade PySide6 (Qt6) touch in
 ├── usb_utils.py                # USB flash drive mount & ST-Link detection
 ├── virtual_keyboard.py         # On-screen touch alphanumeric keyboard and numpad
 ├── theme.py / constants.py     # Dark industrial theme and UI styling
-├── stgobain_lc_rpi_main.c      # STM32 Nucleo firmware for load cell streaming
+├── st_gobain_firm1_mainc.c     # STM32 Nucleo firmware for load cell & sensor rig
 ├── requirements.txt            # Python dependencies
 ├── deploy/                     # Kiosk service scripts and udev rules
 │   ├── kiosk.service           # Systemd kiosk autostart service
@@ -70,9 +70,9 @@ The **InsituMicron Load Cell HMI** is an industrial-grade PySide6 (Qt6) touch in
 
 ## ⚙️ Installation & Running
 
-### 1. Clone the Repository (Main Branch)
+### 1. Clone the Repository (St-gobain-lc Branch)
 ```bash
-git clone -b main https://github.com/aravind-0356/Insitimicron--Stgobain-GUI.git ~/InsituMicron-LoadCell
+git clone -b St-gobain-lc https://github.com/aravind-0356/Insitimicron--Stgobain-GUI.git ~/InsituMicron-LoadCell
 cd ~/InsituMicron-LoadCell
 ```
 
