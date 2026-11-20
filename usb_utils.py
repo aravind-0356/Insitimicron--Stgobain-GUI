@@ -13,7 +13,7 @@ def detect_usb_drive():
         print("Warning: 'psutil' module not found. USB auto-detection is disabled.")
         return None
 
-    partitions = psutil.disk_partitions(all=False)
+    partitions = psutil.disk_partitions(all=True)
     system = platform.system()
 
     largest_mount = None

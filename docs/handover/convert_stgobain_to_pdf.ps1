@@ -1,0 +1,47 @@
+# convert_stgobain_to_pdf.ps1
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
+
+$docPath = "C:\Users\rohit\work\GUI files\Pi_HMI\Pi_HMI_mtr\docs\handover\InsituMicron_StGobain_Technical_Handover_Manual_V1.0.docx"
+$pdfPath = [System.IO.Path]::ChangeExtension($docPath, ".pdf")
+
+Write-Output "Processing Word Document: $docPath"
+$doc = $word.Documents.Open($docPath)
+
+# Update fields and TOC
+$doc.Fields.Update()
+
+try {
+    $s1 = $doc.Styles.Item("TOC 1")
+    $s1.Font.Size = 9.5
+    $s1.ParagraphFormat.SpaceBefore = 2
+    $s1.ParagraphFormat.SpaceAfter = 1
+    $s1.ParagraphFormat.LineSpacingRule = 0
+} catch {}
+
+try {
+    $s2 = $doc.Styles.Item("TOC 2")
+    $s2.Font.Size = 8.5
+    $s2.ParagraphFormat.SpaceBefore = 0.5
+    $s2.ParagraphFormat.SpaceAfter = 0.5
+    $s2.ParagraphFormat.LineSpacingRule = 0
+} catch {}
+
+foreach ($toc in $doc.TablesOfContents) {
+    $toc.Update()
+}
+$doc.Fields.Update()
+
+# Save updated docx
+$doc.Save()
+
+# Export to PDF (17 = wdFormatPDF)
+$wdFormatPDF = 17
+$doc.SaveAs([ref]$pdfPath, [ref]$wdFormatPDF)
+
+$pages = $doc.ComputeStatistics(2) # 2 = wdStatisticPages
+Write-Output "PDF Generated Successfully: $pdfPath ($pages pages)"
+
+$doc.Close([ref]$false)
+$word.Quit()
+Write-Output "PDF Conversion complete."

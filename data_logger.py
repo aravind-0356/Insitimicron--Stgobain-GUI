@@ -188,13 +188,14 @@ class DataLogger:
         with self._lock:
             cur = self._conn.execute(
                 "INSERT INTO tests "
-                "(name, test_mode, started_at, sample_name, test_number, business_type, "
+                "(name, test_mode, started_at, notes, sample_name, test_number, business_type, "
                 " length_mm, width_mm, thickness_mm, constant_load_n, target_heat_rate, calibration_file) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     name, 
                     sample_params.get("test_mode", "TEST"),
                     started_at,
+                    sample_params.get("remarks", sample_params.get("notes", "")),
                     sample_params.get("sample_name", ""),
                     sample_params.get("test_number", ""),
                     sample_params.get("business_type", ""),
@@ -332,12 +333,12 @@ class DataLogger:
             if not timestamps:
                 return 0
 
-            # Get test metadata for the header (including sample params)
+            # Get test metadata for the header (including sample params and remarks)
             with self._lock:
                 cur = self._conn.execute(
                     "SELECT name, started_at, duration_s, "
                     "       sample_name, test_number, business_type, length_mm, "
-                    "       width_mm, thickness_mm, constant_load_n, target_heat_rate, calibration_file, test_mode "
+                    "       width_mm, thickness_mm, constant_load_n, target_heat_rate, calibration_file, test_mode, notes "
                     "FROM tests WHERE test_id=?",
                     (test_id,)
                 )
@@ -372,6 +373,8 @@ class DataLogger:
                         writer.writerow([f"# Target Heat Rate (C/min): {test_info[10]}"])
                     if test_info[11]:  # calibration_file
                         writer.writerow([f"# Calibration File: {test_info[11]}"])
+                    if len(test_info) > 13 and test_info[13]:  # notes / remarks
+                        writer.writerow([f"# Remarks: {test_info[13]}"])
                     writer.writerow([])
 
                 # Column headers
@@ -402,10 +405,10 @@ class DataLogger:
         Returns:
             The full path of the exported CSV, or None on error.
         """
-        # Get test name for filename
+        # Get test name and mode for filename and folder routing
         with self._lock:
             cur = self._conn.execute(
-                "SELECT name FROM tests WHERE test_id=?", (test_id,)
+                "SELECT name, test_mode FROM tests WHERE test_id=?", (test_id,)
             )
             row = cur.fetchone()
 
@@ -413,8 +416,13 @@ class DataLogger:
             return None
 
         test_name = row[0].replace(" ", "_").replace("/", "-")
+        test_mode = row[1] if len(row) > 1 and row[1] else "TEST"
+        subfolder = "calibrations" if test_mode == "CALIBRATION" else "tests"
+        target_dir = os.path.join(usb_mount_path, subfolder)
+        os.makedirs(target_dir, exist_ok=True)
+
         filename = f"{test_name}.csv"
-        output_path = os.path.join(usb_mount_path, filename)
+        output_path = os.path.join(target_dir, filename)
 
         rows = self.export_test_to_csv(test_id, output_path)
         if rows >= 0:

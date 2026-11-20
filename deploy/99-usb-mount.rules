@@ -1,0 +1,3 @@
+# UDEV rule to silently mount USB drives for the kiosk
+ACTION=="add", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/bin/systemd-mount -o uid=1000,gid=1000,dmask=000,fmask=000,flush --no-block --automount=yes --collect $devnode /media/usb"
+ACTION=="remove", SUBSYSTEMS=="usb", SUBSYSTEM=="block", ENV{ID_FS_USAGE}=="filesystem", RUN+="/usr/bin/systemd-umount /media/usb"

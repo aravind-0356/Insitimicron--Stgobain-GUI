@@ -153,6 +153,7 @@ class FileBrowserDialog(QDialog):
         self.data_logger = data_logger
         self.calibration_only = calibration_only
         self.selected_test_ids = []
+        self.selected_test_names = []
         
         self.setWindowTitle("Browse Calibration Tests" if calibration_only else "Browse Saved Tests")
         self.setMinimumSize(800, 480)
@@ -163,8 +164,8 @@ class FileBrowserDialog(QDialog):
         # Test Table
         self.test_table = QTableWidget()
         if self.calibration_only:
-            self.test_table.setColumnCount(2)
-            self.test_table.setHorizontalHeaderLabels(["Test Name", "Heat Rate (C/min)"])
+            self.test_table.setColumnCount(3)
+            self.test_table.setHorizontalHeaderLabels(["Calibration Name", "Recorded At", "Heat Rate (C/min)"])
             self.test_table.setSelectionMode(QAbstractItemView.SingleSelection)
         else:
             self.test_table.setColumnCount(4)
@@ -266,13 +267,27 @@ class FileBrowserDialog(QDialog):
 
             name_item = create_item(test["name"])
             name_item.setData(Qt.UserRole, test["test_id"])
+            name_item.setData(Qt.UserRole + 1, test["name"])
             self.test_table.setItem(row, 0, name_item)
             
-            hr = test.get("target_heat_rate")
-            hr_str = f"{hr:.1f}" if hr is not None else "N/A"
-            self.test_table.setItem(row, 1, create_item(hr_str))
-            
-            if not self.calibration_only:
+            # Format started_at for a clean human-readable date/time display
+            started_raw = test.get("started_at", "")
+            if "T" in started_raw:
+                parts = started_raw.split("T")
+                time_part = parts[1].split(".")[0][:5]
+                date_str = f"{parts[0]} {time_part}"
+            else:
+                date_str = started_raw[:16] if started_raw else "N/A"
+
+            if self.calibration_only:
+                self.test_table.setItem(row, 1, create_item(date_str))
+                hr = test.get("target_heat_rate")
+                hr_str = f"{hr:.1f} C/min" if hr is not None else "N/A"
+                self.test_table.setItem(row, 2, create_item(hr_str))
+            else:
+                hr = test.get("target_heat_rate")
+                hr_str = f"{hr:.1f}" if hr is not None else "N/A"
+                self.test_table.setItem(row, 1, create_item(hr_str))
                 dur = test["duration_s"]
                 dur_str = f"{dur:.1f}s" if dur is not None else "Running..."
                 self.test_table.setItem(row, 2, create_item(dur_str))
@@ -294,9 +309,21 @@ class FileBrowserDialog(QDialog):
         if not self.selected_test_ids:
             QMessageBox.warning(self, "No Selection", "Please select one or more tests.")
             return
-        if len(self.selected_test_ids) > 5:
+        if not self.calibration_only and len(self.selected_test_ids) > 5:
             QMessageBox.warning(self, "Limit Exceeded", "You can only compare a maximum of 5 tests at a time.\nPlease deselect some tests.")
             return
+
+        # Record human-readable test/calibration names for selected items
+        self.selected_test_names = []
+        selected_rows = set()
+        for item in self.test_table.selectedItems():
+            selected_rows.add(item.row())
+        for row in sorted(selected_rows):
+            id_item = self.test_table.item(row, 0)
+            if id_item:
+                name_val = id_item.data(Qt.UserRole + 1) or id_item.text()
+                self.selected_test_names.append(str(name_val))
+
         self.accept()
         
     def export_usb(self):
@@ -345,12 +372,21 @@ class FileBrowserDialog(QDialog):
                 QCoreApplication.processEvents()
                 
                 tests = self.data_logger.get_all_tests()
+                current_test = None
                 name = f"Test_{test_id}"
                 for t in tests:
                     if t["test_id"] == test_id:
+                        current_test = t
                         name = t["name"].replace(" ", "_").replace("/", "-")
                         break
-                path = os.path.join(folder, f"{name}.csv")
+
+                # Separate calibrations and tests into organized USB folders
+                is_calib = current_test and (current_test.get("test_mode") == "CALIBRATION")
+                subfolder = "calibrations" if is_calib else "tests"
+                target_dir = os.path.join(folder, subfolder)
+                os.makedirs(target_dir, exist_ok=True)
+
+                path = os.path.join(target_dir, f"{name}.csv")
                 rows = self.data_logger.export_test_to_csv(test_id, path, yield_callback=QCoreApplication.processEvents)
                 if rows > 0:
                     exported += 1
@@ -367,7 +403,7 @@ class FileBrowserDialog(QDialog):
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Information)
             msg.setWindowTitle("Export Complete")
-            msg.setText(f"Exported {exported} test(s) to:\n{folder}\n\nIt is now safe to remove the USB drive.")
+            msg.setText(f"Exported {exported} item(s) to:\n{folder}\n(organized in 'tests/' and 'calibrations/')\n\nIt is now safe to remove the USB drive.")
             msg.addButton("OK", QMessageBox.AcceptRole)
             msg.exec()
         except Exception as e:
@@ -412,7 +448,7 @@ class MainWindow(QMainWindow):
         self.data_logger = DataLogger()
         self._is_test_running = False
         self.load_offset = 0.0
-        self.disp_offset = 0.0
+        self.disp_offset = None
         self.test_start_time = 0.0
 
         # Break detection state
@@ -518,6 +554,25 @@ class MainWindow(QMainWindow):
         drawer_layout.addWidget(self.sidebar, stretch=1)
 
         # Action buttons at bottom (no addStretch — sidebar list fills remaining space)
+
+        self.btn_motor_stop = QPushButton("Motor Stop")
+        self.btn_motor_stop.setFixedHeight(55)
+        self.btn_motor_stop.setStyleSheet("""
+            QPushButton {
+                background-color: #c0392b;
+                border: none; font-size: 18px; font-weight: bold;
+                border-radius: 6px; margin: 3px 10px; color: white;
+                border-bottom: 3px solid #78281f;
+            }
+            QPushButton:pressed {
+                background-color: #962d22;
+                border-bottom: 0px solid #78281f;
+                margin: 6px 10px 3px 10px;
+            }
+            QPushButton:hover { background-color: #d9534f; }
+        """)
+        drawer_layout.addWidget(self.btn_motor_stop)
+        drawer_layout.addSpacing(16)
 
         self.btn_start_test = QPushButton("Start Test")
         self.btn_start_test.setFixedHeight(55)
@@ -745,6 +800,15 @@ class MainWindow(QMainWindow):
             QPushButton:pressed { background-color: #004a66; }
         """)
         self.btn_browse_calib.clicked.connect(self._browse_calibration_file)
+
+        self.btn_clear_calib = QPushButton("Clear")
+        self.btn_clear_calib.setFixedHeight(40)
+        self.btn_clear_calib.setStyleSheet("""
+            QPushButton { background-color: #7f8c8d; color: white; border: none; font-size: 16px; font-weight: bold; border-radius: 4px; padding: 0 14px; }
+            QPushButton:hover { background-color: #95a5a6; }
+            QPushButton:pressed { background-color: #636e72; }
+        """)
+        self.btn_clear_calib.clicked.connect(lambda: self.lbl_selected_calib.setText("None"))
         
         self.lbl_selected_calib = QLabel("None")
         self.lbl_selected_calib.setStyleSheet("font-size: 16px; font-weight: bold; color: #2c3e50; padding-left: 10px;")
@@ -752,11 +816,18 @@ class MainWindow(QMainWindow):
         calib_layout = QHBoxLayout()
         calib_layout.setContentsMargins(0, 0, 0, 0)
         calib_layout.addWidget(self.btn_browse_calib)
+        calib_layout.addWidget(self.btn_clear_calib)
         calib_layout.addWidget(self.lbl_selected_calib)
         calib_layout.addStretch()
         
         self.lbl_calib_title = self._form_label("Calibration File:")
         env_form.addRow(self.lbl_calib_title, calib_layout)
+
+        self.inp_remarks = TouchLineEdit(
+            mode="text", title="Enter Remarks"
+        )
+        self.inp_remarks.setPlaceholderText("Tap to enter remarks (optional)...")
+        env_form.addRow(self._form_label("Remarks:"), self.inp_remarks)
 
         right_col.addWidget(env_group)
         
@@ -784,6 +855,7 @@ class MainWindow(QMainWindow):
             self.inp_calib_name_lbl.show()
             
             self.btn_browse_calib.hide()
+            self.btn_clear_calib.hide()
             self.lbl_selected_calib.hide()
             self.lbl_calib_title.hide()
         else:
@@ -793,13 +865,18 @@ class MainWindow(QMainWindow):
             self.inp_calib_name_lbl.hide()
             
             self.btn_browse_calib.show()
+            self.btn_clear_calib.show()
             self.lbl_selected_calib.show()
             self.lbl_calib_title.show()
 
     def _browse_calibration_file(self):
         dialog = FileBrowserDialog(self.data_logger, self, calibration_only=True)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_test_ids:
-            self.lbl_selected_calib.setText(str(dialog.selected_test_ids[0]))
+            if hasattr(dialog, 'selected_test_names') and dialog.selected_test_names:
+                chosen_name = dialog.selected_test_names[0]
+            else:
+                chosen_name = str(dialog.selected_test_ids[0])
+            self.lbl_selected_calib.setText(chosen_name)
 
     def _form_label(self, text):
         """Create a styled form label."""
@@ -850,6 +927,7 @@ class MainWindow(QMainWindow):
         self.btn_jog_down.setStyleSheet("""
             QPushButton { background-color: #005b7f; color: white; font-size: 16px; font-weight: bold; border-radius: 6px; padding: 6px 12px; }
             QPushButton:pressed { background-color: #003f5c; }
+            QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; border: 1px solid #b2bec3; }
         """)
         self.btn_jog_down.pressed.connect(self._motor_jog_down)
         self.btn_jog_down.released.connect(self._motor_stop)
@@ -971,28 +1049,35 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_last_raw_disp'):
             self.disp_offset = self._last_raw_disp
             self.lbl_disp_tared.setText("0.000 mm")
+            self._break_peak_disp = 0.0
+            if hasattr(self, 'lbl_peak_disp'):
+                self.lbl_peak_disp.setText("0.000 mm")
 
     def _motor_jog_up(self):
         # Velocity in RPM from settings
         vel = self.settings.get("motor_jog_velocity_rpm", 10.0)
         self.serial_manager.send_command(f"Vel:{vel}\n")
-        
-        # Give STM32 20ms to parse the Vel command before sending JogUp,
-        # otherwise they collide in the RX buffer (e.g., "Vel:10.0JogUp")
-        import time
-        time.sleep(0.02)
-        
         self.serial_manager.send_command("JogUp\n")
 
     def _motor_jog_down(self):
+        if getattr(self, '_last_raw_disp', 100.0) < 3.5:
+            return
         vel = self.settings.get("motor_jog_velocity_rpm", 10.0)
         self.serial_manager.send_command(f"Vel:{vel}\n")
-        import time
-        time.sleep(0.02)
         self.serial_manager.send_command("JogDown\n")
 
     def _motor_stop(self):
         self.serial_manager.send_command("Stop\n")
+
+    @Slot()
+    def _on_motor_stop_clicked(self):
+        """Immediately halt the motor regardless of current state."""
+        self.serial_manager.send_command("Stop\n")
+        if hasattr(self, 'lbl_break_status') and self.lbl_break_status.text() == "PULLING BACK...":
+            self.lbl_break_status.setText("STOPPED")
+            self.lbl_break_status.setStyleSheet(
+                "font-size: 13px; color: #e74c3c; font-weight: bold; background-color: transparent;"
+            )
 
     def _toggle_break_detection(self):
         """Toggle break detection on/off and update button appearance."""
@@ -1036,10 +1121,6 @@ class MainWindow(QMainWindow):
                 "font-size: 13px; color: #7f8c8d; font-weight: bold; background-color: transparent;"
             )
 
-    def _tare_disp(self):
-        if hasattr(self, '_last_raw_disp'):
-            self.disp_offset = self._last_raw_disp
-            self.lbl_disp_tared.setText("0.000 mm")
 
     def _build_history_page(self):
         """Build the Test Analysis page with a fullscreen graph and a Browse button."""
@@ -1685,6 +1766,7 @@ class MainWindow(QMainWindow):
         self.serial_manager.new_data.connect(self.update_graph)
         self.serial_manager.connection_status_changed.connect(self._on_connection_changed)
         self.serial_manager.pullback_done.connect(self._on_pullback_done)
+        self.btn_motor_stop.clicked.connect(self._on_motor_stop_clicked)
         self.btn_start_test.clicked.connect(self.start_test)
         self.btn_stop_test.clicked.connect(self.stop_test)
 
@@ -1732,7 +1814,33 @@ class MainWindow(QMainWindow):
         self._last_raw_temp = temp_raw
         self._last_enc      = enc_counts
 
-        disp_tared = disp_raw - self.disp_offset
+        # ── Raw Displacement Lower Limit Safety Check (< 3.500 mm) ──
+        if disp_raw < 3.5:
+            if not getattr(self, '_disp_limit_active', False):
+                self._disp_limit_active = True
+                self._motor_stop()
+                if self._is_test_running:
+                    self.stop_test(show_popup=False)
+                if hasattr(self, 'btn_jog_down'):
+                    self.btn_jog_down.setEnabled(False)
+                QMessageBox.warning(
+                    self, "Displacement Lower Limit Warning",
+                    f"Raw displacement ({disp_raw:.3f} mm) has dropped below 3.500 mm!\n"
+                    "Motor has been automatically stopped for safety.\n\n"
+                    "Jog DOWN is disabled. Please Jog UP to raise the sensor above 3.500 mm."
+                )
+            else:
+                if hasattr(self, 'btn_jog_down') and self.btn_jog_down.isEnabled():
+                    self.btn_jog_down.setEnabled(False)
+        else:
+            if getattr(self, '_disp_limit_active', False):
+                self._disp_limit_active = False
+                if hasattr(self, 'btn_jog_down') and not self.btn_jog_down.isEnabled():
+                    self.btn_jog_down.setEnabled(True)
+
+        # Compression is positive travel into the sample (initial tare point - current gap).
+        # Option B: Before Tare is pressed, display raw displacement live on the main readout.
+        disp_tared = (self.disp_offset - disp_raw) if self.disp_offset is not None else disp_raw
         comp_disp  = disp_tared
 
         # Always update encoder label (faded, every packet)
@@ -1748,8 +1856,8 @@ class MainWindow(QMainWindow):
                 self.lbl_disp_raw.setText(f"Raw: {disp_raw:.3f} mm")
                 self.lbl_disp_tared.setText(f"{disp_tared:.3f} mm")
                 
-                # Update break peak
-                if disp_tared > getattr(self, '_break_peak_disp', 0.0):
+                # Update break peak (tracked only after tared)
+                if self.disp_offset is not None and disp_tared > getattr(self, '_break_peak_disp', 0.0):
                     self._break_peak_disp = disp_tared
                     self.lbl_peak_disp.setText(f"{self._break_peak_disp:.3f} mm")
             return
@@ -1799,29 +1907,32 @@ class MainWindow(QMainWindow):
                     self.lbl_break_status.setStyleSheet(
                         "font-size: 13px; color: #e74c3c; font-weight: bold; background-color: transparent;"
                     )
-                    # Stop recording data immediately
-                    self.stop_test()
 
-                    pullback_mode = int(self.settings.get("break_action_mode", 0))
+                    pullback_mode = int(self.settings.get("break_action_mode", 1))
                     if pullback_mode == 1:
-                        # Send pullback speed first so firmware uses the right RPM
+                        # 1. Send pullback commands immediately without any modal delay
                         pb_speed  = self.settings.get("pullback_speed_rpm", 20.0)
                         pb_dist   = self.settings.get("pullback_distance_mm", 5.0)
-                        # Stepper scaling: 4000 counts per revolution.
-                        # Assuming a standard 5mm pitch leadscrew as placeholder (adjust MM_PER_REV as needed)
+                        # Stepper scaling: 4000 counts per revolution (Leadshine CS2RS 1000-line encoder with 4x quadrature).
+                        # Actuation scaling: 1 rotation = 8.0 mm linear travel.
                         ENCODER_CPR = 4000.0
-                        MM_PER_REV = 5.0
-                        counts_per_mm = ENCODER_CPR / MM_PER_REV
+                        MM_PER_REV = 8.0
+                        counts_per_mm = ENCODER_CPR / MM_PER_REV  # 500 counts/mm
                         pb_counts = int(pb_dist * counts_per_mm)
                         self.serial_manager.send_command(f"PullSpeed:{int(pb_speed)}")
                         self.serial_manager.send_command(f"Pullback:{pb_counts}")
+
                         self.lbl_break_status.setText("PULLING BACK...")
                         self.lbl_break_status.setStyleSheet(
                             "font-size: 13px; color: #e67e22; font-weight: bold; background-color: transparent;"
                         )
+
+                        # 2. Stop recording quietly in background (no modal popup to block execution)
+                        self.stop_test(show_popup=False)
                         # Popup will appear when _on_pullback_done() fires via PULLBACK_DONE signal
                     else:
-                        # Stop-only mode — show popup immediately
+                        # Stop-only mode — stop test quietly and show popup
+                        self.stop_test(show_popup=False)
                         QMessageBox.information(
                             self, "Break Detected",
                             f"A material break was detected.\n"
@@ -1860,7 +1971,8 @@ class MainWindow(QMainWindow):
             "thickness_mm": _safe_float(self.inp_thickness.text()),
             "constant_load_n": _safe_float(self.inp_constant_load.text()),
             "target_heat_rate": _safe_float(self.inp_heat_rate.text()),
-            "calibration_file": "" if is_calib else (self.lbl_selected_calib.text() if self.lbl_selected_calib.text() != "None" else "")
+            "calibration_file": "" if is_calib else (self.lbl_selected_calib.text() if self.lbl_selected_calib.text() != "None" else ""),
+            "remarks": self.inp_remarks.text().strip() if hasattr(self, 'inp_remarks') else ""
         }
 
     # =========================================================
@@ -1921,22 +2033,28 @@ class MainWindow(QMainWindow):
             return
 
         sample_params = self._collect_sample_params()
+        is_calib = (sample_params.get("test_mode") == "CALIBRATION")
         
         # Pre-flight Validation
         missing_fields = []
-        if not sample_params["sample_name"]: missing_fields.append("Sample ID")
-        if not sample_params["test_number"]: missing_fields.append("Test Number")
-        
-        if sample_params["test_mode"] == "TEST" and not sample_params["business_type"]:
-            missing_fields.append("Business Type")
-        if sample_params["test_mode"] == "CALIBRATION" and not sample_params["calibration_name"]:
-            missing_fields.append("Calibration Name")
+        if is_calib:
+            if not sample_params.get("calibration_name"):
+                missing_fields.append("Calibration Name")
+        else:
+            if not sample_params.get("sample_name"):
+                missing_fields.append("Sample ID")
+            if not sample_params.get("test_number"):
+                missing_fields.append("Test Number")
+            if not sample_params.get("business_type"):
+                missing_fields.append("Business Type")
+            if sample_params.get("length_mm") is None:
+                missing_fields.append("Span Length")
+            if sample_params.get("width_mm") is None:
+                missing_fields.append("Width")
+            if sample_params.get("thickness_mm") is None:
+                missing_fields.append("Height")
 
-        if sample_params["length_mm"] is None: missing_fields.append("Span Length")
-        if sample_params["width_mm"] is None: missing_fields.append("Width")
-        if sample_params["thickness_mm"] is None: missing_fields.append("Height")
-        if sample_params["constant_load_n"] is None: missing_fields.append("Constant Load")
-        if sample_params["target_heat_rate"] is None: missing_fields.append("Target Heat Rate")
+        # Note: Constant Load and Target Heat Rate are strictly optional in both modes
 
         if missing_fields:
             QMessageBox.warning(
@@ -1956,6 +2074,10 @@ class MainWindow(QMainWindow):
             sample_params.get("thickness_mm")
         )
 
+        # Auto-tare displacement at test start if not explicitly tared beforehand
+        if self.disp_offset is None and hasattr(self, '_last_raw_disp'):
+            self.disp_offset = self._last_raw_disp
+
         # Reset break detection arm state for the new test
         self._break_peak_disp = 0.0
         self._break_armed = False
@@ -1966,18 +2088,23 @@ class MainWindow(QMainWindow):
                 "font-size: 13px; color: #7f8c8d; font-weight: bold; background-color: transparent;"
             )
 
-        # Use sample name as test name if provided, else auto-generate
+        # Build name according to test mode:
+        # Option A: Calibration uses the user's calibration name + timestamp.
+        # Test mode uses sample_name + Run{test_number} + timestamp.
         from datetime import datetime
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        test_name = sample_params.get("sample_name", "")
-        test_number = sample_params.get("test_number", "")
-        
-        if test_name and test_number:
-            name = f"{test_name}_Run{test_number}_{ts}"
-        elif test_name:
-            name = f"{test_name}_{ts}"
+        if is_calib:
+            calib_name = sample_params.get("calibration_name", "").strip()
+            name = f"{calib_name}_{ts}" if calib_name else f"Calib_{ts}"
         else:
-            name = f"Test_{ts}" 
+            test_name = sample_params.get("sample_name", "").strip()
+            test_number = sample_params.get("test_number", "").strip()
+            if test_name and test_number:
+                name = f"{test_name}_Run{test_number}_{ts}"
+            elif test_name:
+                name = f"{test_name}_{ts}"
+            else:
+                name = f"Test_{ts}" 
 
         test_id = self.data_logger.start_test(name=name, sample_params=sample_params)
         self._is_test_running = True
@@ -1999,7 +2126,7 @@ class MainWindow(QMainWindow):
         # Switch to Live View
         self.sidebar.setCurrentRow(1)
 
-    def stop_test(self):
+    def stop_test(self, show_popup=True):
         self.serial_manager.is_logging = False
         self._is_test_running = False
         self.recording_timer.stop()
@@ -2014,37 +2141,48 @@ class MainWindow(QMainWindow):
         self.btn_stop_test.setEnabled(False)
 
         if test_id:
-            # Auto-export logic
+            # Auto-export logic with separate folders for calibrations vs tests
             import os
             from PySide6.QtWidgets import QProgressDialog
             
-            export_dir = os.path.join(os.getcwd(), "exports")
-            os.makedirs(export_dir, exist_ok=True)
-            
             tests = self.data_logger.get_all_tests()
+            current_test = None
             name = f"Test_{test_id}"
             for t in tests:
                 if t["test_id"] == test_id:
+                    current_test = t
                     name = t["name"].replace(" ", "_").replace("/", "-")
                     break
+
+            is_calib = current_test and (current_test.get("test_mode") == "CALIBRATION")
+            subfolder = "calibrations" if is_calib else "tests"
+            export_dir = os.path.join(os.getcwd(), "exports", subfolder)
+            os.makedirs(export_dir, exist_ok=True)
             
             export_path = os.path.join(export_dir, f"{name}.csv")
+            self._last_exported_csv = export_path
             
-            progress = QProgressDialog("Saving test data to CSV...", None, 0, 0, self)
-            progress.setWindowTitle("Auto-Exporting")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.show()
-            from PySide6.QtCore import QCoreApplication
-            QCoreApplication.processEvents()
-            
-            self.data_logger.export_test_to_csv(test_id, export_path, yield_callback=QCoreApplication.processEvents)
-            
-            progress.cancel()
+            if show_popup:
+                progress = QProgressDialog("Saving data to CSV...", None, 0, 0, self)
+                progress.setWindowTitle("Auto-Exporting")
+                progress.setWindowModality(Qt.WindowModal)
+                progress.show()
+                from PySide6.QtCore import QCoreApplication
+                QCoreApplication.processEvents()
+                
+                self.data_logger.export_test_to_csv(test_id, export_path, yield_callback=QCoreApplication.processEvents)
+                
+                progress.cancel()
 
-            QMessageBox.information(
-                self, "Test Saved",
-                f"Test data saved and automatically exported to:\n{export_path}"
-            )
+                title_str = "Calibration Saved" if is_calib else "Test Saved"
+                item_str = "Calibration data" if is_calib else "Test data"
+                QMessageBox.information(
+                    self, title_str,
+                    f"{item_str} saved and automatically exported to:\n{export_path}"
+                )
+            else:
+                # Silent export in background without blocking modal dialogs
+                self.data_logger.export_test_to_csv(test_id, export_path)
 
     # =========================================================
     # HISTORY & EXPORT

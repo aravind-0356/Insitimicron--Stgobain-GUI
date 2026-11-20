@@ -66,12 +66,12 @@ uint32_t last_uart2_tx = 0;
 
 // --- Eurotherm Variables ---
 uint8_t eurotherm_rx_buffer[256];
-uint8_t eurotherm_rx_index = 0;
-uint8_t last_eurotherm_rx_index = 0;
+volatile uint16_t eurotherm_rx_index = 0;
+uint16_t last_eurotherm_rx_index = 0;
 uint8_t eurotherm_rx_byte;
 uint8_t eurotherm_state = 0;
 uint32_t last_eurotherm_poll = 0;
-float eurotherm_temp = 0.0f;
+volatile float eurotherm_temp = 0.0f;
 
 /* ======================================================== */
 /* 3. UART RX BUFFERS (For Interrupts)                      */
@@ -132,9 +132,9 @@ static   uint32_t last_enc_poll    = 0;
 /* ======================================================== */
 /* 5. PULLBACK VARIABLES                                    */
 /* ======================================================== */
-// PLACEHOLDER: update ENCODER_COUNTS_PER_MM once measured on hardware
-#define ENCODER_COUNTS_PER_MM    1000
-// Default safe pullback speed (positive = UP). Overridden by PullSpeed: command.
+// Encoder scaling: 4000 counts/rev, 1 rev = 8.0 mm linear travel -> 500 counts/mm
+#define ENCODER_COUNTS_PER_MM    500
+// Default safe pullback speed magnitude (negative velocity is sent to drive UP). Overridden by PullSpeed: command.
 #define PULLBACK_SPEED_DEFAULT   20
 static int16_t  pullback_speed_rpm      = PULLBACK_SPEED_DEFAULT;
 static int32_t  pullback_target_counts  = 0;   /* Counts to travel */
@@ -205,7 +205,7 @@ void modbus_send_motor(uint8_t *frame, uint16_t len) {
 // Background state machine to process motor queue with 5ms delays
 void Process_Motor_TX_Queue(void) {
     uint32_t tick = HAL_GetTick();
-    
+
     // If there are frames waiting to be sent
     if (motor_tx_head != motor_tx_tail) {
         // If the bus is completely free, claim it for the motor queue
@@ -213,7 +213,7 @@ void Process_Motor_TX_Queue(void) {
             encoder_bus_busy = 1;
             motor_is_txing = 1;
         }
-        
+
         // If we own the bus, send the next frame with a 5ms gap
         if (motor_is_txing) {
             if (tick - last_motor_tx_tick >= 5) {
@@ -307,16 +307,16 @@ void Leadshine_Send_Stop(void) {
     // Write Quick Stop to PR Control Register 0x6002 = 0x0040
     // Manual section 5.3.3: "Write value 0x040 to 0x6002 = E-stop"
     uint8_t f_stop[6] = {0x01, 0x06, 0x60, 0x02, 0x00, 0x40};
-    memcpy(frame, f_stop, 6); append_crc(frame, 6); 
-    
-    // BURST STOP: The Leadshine drive often ignores Modbus commands if it is currently 
+    memcpy(frame, f_stop, 6); append_crc(frame, 6);
+
+    // BURST STOP: The Leadshine drive often ignores Modbus commands if it is currently
     // busy calculating acceleration curves from a Start command received just milliseconds prior.
     // By spamming the Stop command 4 times (spanning 20ms), we guarantee the drive catches it.
     modbus_send_motor(frame, 8);
     modbus_send_motor(frame, 8);
     modbus_send_motor(frame, 8);
     modbus_send_motor(frame, 8);
-    
+
     DBG_PRINT("DBG: STOP burst sent -> 0x6002=0x0040 (Quick Stop)\r\n");
 }
 
@@ -339,6 +339,16 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         sensor_state = 0; // Reset sensor state machine
         HAL_UART_Receive_IT(&huart3, &sensor_rx_byte, 1); // Restart reception
     }
+    else if (huart->Instance == UART5) {
+        // Clear all UART5 error flags
+        __HAL_UART_CLEAR_OREFLAG(huart);
+        __HAL_UART_CLEAR_NEFLAG(huart);
+        __HAL_UART_CLEAR_FEFLAG(huart);
+        __HAL_UART_CLEAR_PEFLAG(huart);
+        eurotherm_state = 0; // Reset eurotherm state machine
+        eurotherm_rx_index = 0;
+        HAL_UART_Receive_IT(&huart5, &eurotherm_rx_byte, 1); // Restart reception
+    }
 }
 
 // ---------------------------------------------------------
@@ -357,8 +367,11 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     }
     else if (huart->Instance == UART5) {
         // Eurotherm Modbus buffer
-        eurotherm_rx_buffer[eurotherm_rx_index++] = eurotherm_rx_byte;
-        if(eurotherm_rx_index >= 256) eurotherm_rx_index = 0; // Prevent overflow
+        if (eurotherm_rx_index < sizeof(eurotherm_rx_buffer)) {
+            eurotherm_rx_buffer[eurotherm_rx_index++] = eurotherm_rx_byte;
+        } else {
+            eurotherm_rx_index = 0;
+        }
         HAL_UART_Receive_IT(&huart5, &eurotherm_rx_byte, 1);
     }
     else if (huart->Instance == USART3) {
@@ -433,15 +446,15 @@ void Process_Pi_Commands(void) {
                     pi_cmd_start    = true;
                     pi_cmd_stop     = false;
                     pi_cmd_pullback = false;
-                    motor_speed_setpoint = abs(motor_speed_setpoint); // CW direction
-                    DBG_PRINT("DBG: CMD=JogUp -> pi_cmd_start set\r\n");
+                    motor_speed_setpoint = -abs(motor_speed_setpoint); // Negative speed = retract UP
+                    DBG_PRINT("DBG: CMD=JogUp -> pi_cmd_start set (up)\r\n");
                 }
                 else if (strncmp(cmd_buf, "JogDown", 7) == 0) {
                     pi_cmd_start    = true;
                     pi_cmd_stop     = false;
                     pi_cmd_pullback = false;
-                    motor_speed_setpoint = -abs(motor_speed_setpoint); // CCW direction
-                    DBG_PRINT("DBG: CMD=JogDown -> pi_cmd_start set (reverse)\r\n");
+                    motor_speed_setpoint = abs(motor_speed_setpoint); // Positive speed = advance DOWN
+                    DBG_PRINT("DBG: CMD=JogDown -> pi_cmd_start set (down)\r\n");
                 }
                 else if (strncmp(cmd_buf, "Vel:", 4) == 0) {
                     int speed = atoi(&cmd_buf[4]);
@@ -531,21 +544,33 @@ void Process_Motor(void) {
     }
     */
 
-    /* ── PULLBACK: takes priority over normal start/stop ── */
+    /* ── MOTOR STOP: ABSOLUTE HIGHEST PRIORITY (halts motor no matter what) ── */
+    if (pi_cmd_stop) {
+        pi_cmd_stop     = false;
+        pi_cmd_start    = false;
+        pi_cmd_pullback = false;
+        Leadshine_Send_Stop();
+        current_motor_state = MOTOR_IDLE;
+        DBG_PRINT("DBG: MOTOR STOP executed — motor forced IDLE\r\n");
+        return;
+    }
+
+    /* ── PULLBACK: initiates auto-reverse after break detection ── */
     if (pi_cmd_pullback) {
         pi_cmd_pullback         = false;
         pullback_start_position = g_encoder_position;
-        Leadshine_Send_Start(pullback_speed_rpm);
+        int16_t retract_speed   = -abs(pullback_speed_rpm); /* Negative velocity to retract UP */
+        Leadshine_Send_Start(retract_speed);
         current_motor_state     = MOTOR_PULLBACK;
         len = snprintf(dbg, sizeof(dbg), "DBG: PULLBACK START spd=%d enc_start=%ld\r\n",
-                       pullback_speed_rpm, (long)pullback_start_position);
+                       retract_speed, (long)pullback_start_position);
         HAL_UART_Transmit(&huart2, (uint8_t*)dbg, len, 20);
         return;
     }
 
     /* ── MONITOR PULLBACK PROGRESS ── */
     if (current_motor_state == MOTOR_PULLBACK) {
-        int32_t travelled = g_encoder_position - pullback_start_position;
+        int32_t travelled = labs(g_encoder_position - pullback_start_position);
         if (travelled >= pullback_target_counts) {
             Leadshine_Send_Stop();
             current_motor_state = MOTOR_IDLE;
@@ -554,19 +579,6 @@ void Process_Motor(void) {
             const char *done_msg = "PULLBACK_DONE\r\n";
             HAL_UART_Transmit(&huart2, (uint8_t*)done_msg, 15, 20);
         }
-        return;
-    }
-
-    /* ── NORMAL STOP ── */
-    if (pi_cmd_stop) {
-        if (current_motor_state != MOTOR_IDLE) {
-            Leadshine_Send_Stop();
-            current_motor_state = MOTOR_IDLE;
-            DBG_PRINT("DBG: STOP frame sent — motor IDLE\r\n");
-        } else {
-            DBG_PRINT("DBG: STOP received but motor already IDLE\r\n");
-        }
-        pi_cmd_stop = false;
         return;
     }
 
@@ -596,32 +608,55 @@ void Process_Eurotherm(void) {
         // Poll every 500ms
         if (current_tick - last_eurotherm_poll >= 500) {
             // Modbus Read Holding Registers: Slave 1, Func 3, Addr 1, 1 Register
-            // FIX: Made static (fixes the stack bug) and using non-blocking IT transmit
             static uint8_t req[8] = {0x01, 0x03, 0x00, 0x01, 0x00, 0x01, 0, 0};
             uint16_t crc = modbus_crc(req, 6);
             req[6] = crc & 0xFF;
             req[7] = (crc >> 8) & 0xFF;
+
+            // Synchronously send 8 bytes (~8.3ms @ 9600 baud)
+            // Synchronous transmit guarantees all 8 bytes leave the shift register
+            // and completely avoids HAL_BUSY or missing TX interrupt race conditions.
+            HAL_UART_Transmit(&huart5, req, 8, 20);
+
+            // Flush any transceiver turnaround glitch / echo produced during transmit
             eurotherm_rx_index = 0;
-            HAL_UART_Transmit_IT(&huart5, req, 8); // Non-blocking transmit
-            last_eurotherm_poll = current_tick;
+
+            last_eurotherm_poll = HAL_GetTick();
             eurotherm_state = 1;
         }
     }
     else if (eurotherm_state == 1) {
-        // Check for idle line to indicate end of response
-        if (eurotherm_rx_index > 0 && eurotherm_rx_index == last_eurotherm_rx_index) {
-            // Check SlaveID (0x01), Func (0x03), and ByteCount (0x02) to ignore TX echoes
-            if (eurotherm_rx_index >= 7 && eurotherm_rx_buffer[0] == 0x01 && eurotherm_rx_buffer[1] == 0x03 && eurotherm_rx_buffer[2] == 0x02) {
-                uint16_t received_crc = (eurotherm_rx_buffer[eurotherm_rx_index - 1] << 8) | eurotherm_rx_buffer[eurotherm_rx_index - 2];
-                uint16_t calculated_crc = modbus_crc(eurotherm_rx_buffer, eurotherm_rx_index - 2);
+        // Complete Modbus FC03 response for 1 register is 7 bytes:
+        // [SlaveID(0x01), Func(0x03), ByteCount(0x02), Data_H, Data_L, CRC_L, CRC_H]
+        if (eurotherm_rx_index >= 7) {
+            uint8_t frame_found = 0;
+            // Scan buffer with sliding window to tolerate leading line noise or transceiver jitter
+            for (uint16_t i = 0; i <= (uint16_t)(eurotherm_rx_index - 7); i++) {
+                if (eurotherm_rx_buffer[i] == 0x01 && eurotherm_rx_buffer[i+1] == 0x03 && eurotherm_rx_buffer[i+2] == 0x02) {
+                    uint16_t received_crc = ((uint16_t)eurotherm_rx_buffer[i+6] << 8) | eurotherm_rx_buffer[i+5];
+                    uint16_t calculated_crc = modbus_crc(&eurotherm_rx_buffer[i], 5);
 
-                if (received_crc == calculated_crc) {
-                    int16_t raw_temp = (eurotherm_rx_buffer[3] << 8) | eurotherm_rx_buffer[4];
-                    eurotherm_temp = (float)raw_temp; // Match python script: 0 decimal places
+                    if (received_crc == calculated_crc) {
+                        int16_t raw_temp = (int16_t)((eurotherm_rx_buffer[i+3] << 8) | eurotherm_rx_buffer[i+4]);
+                        // If Eurotherm sends integer temp (0 decimals, e.g. 27 for 27°C):
+                        // If configured with 1 decimal place (e.g. 270 for 27.0°C):
+                        if (raw_temp > 500 || raw_temp < -200) {
+                            eurotherm_temp = (float)raw_temp / 10.0f;
+                        } else {
+                            eurotherm_temp = (float)raw_temp;
+                        }
+                        frame_found = 1;
+                        break;
+                    }
                 }
             }
-            eurotherm_state = 0; // Go back to poll
-        } else if (current_tick - last_eurotherm_poll >= 250) { // 250ms timeout (increased for 9600 baud)
+
+            if (frame_found) {
+                eurotherm_state = 0; // Valid frame parsed, cycle complete
+            } else if (current_tick - last_eurotherm_poll >= 400) {
+                eurotherm_state = 0;
+            }
+        } else if (current_tick - last_eurotherm_poll >= 400) { // 400ms timeout
             eurotherm_state = 0;
         }
     }
@@ -637,9 +672,9 @@ void Process_Sensor(void) {
                 // Using non-blocking IT transmit as requested.
                 static uint8_t req[] = {0x10, 0x7E, 0x01, 0x4C, 0xCB, 0x16};
                 sensor_rx_index = 0; // Clear the buffer for a fresh response
-                
+
                 HAL_UART_Transmit_IT(&huart3, req, 6); // Non-blocking transmit
-                
+
                 last_me_req_tick = tick;
                 sensor_state = 1;
             }

@@ -1,0 +1,81 @@
+{
+  "document_geometry": {
+    "page_size": "A4",
+    "width_inches": 8.27,
+    "height_inches": 11.69,
+    "margins_inches": {
+      "top": 1.0,
+      "bottom": 1.0,
+      "left": 1.0,
+      "right": 1.0
+    },
+    "header_distance_inches": 0.5,
+    "footer_distance_inches": 0.5
+  },
+  "typography": {
+    "body": {
+      "font_name": "Segoe UI",
+      "font_size_pt": 10.0,
+      "color_hex": "2C3E50",
+      "line_spacing": 1.15,
+      "space_after_pt": 5
+    },
+    "heading_1": {
+      "font_name": "Segoe UI Semibold",
+      "font_size_pt": 17.0,
+      "color_hex": "005B7F",
+      "bold": true,
+      "space_before_pt": 12,
+      "space_after_pt": 8,
+      "keep_with_next": true
+    },
+    "heading_2": {
+      "font_name": "Segoe UI Semibold",
+      "font_size_pt": 13.0,
+      "color_hex": "00A8CC",
+      "bold": true,
+      "space_before_pt": 12,
+      "space_after_pt": 5,
+      "keep_with_next": true
+    },
+    "heading_3": {
+      "font_name": "Segoe UI Semibold",
+      "font_size_pt": 10.5,
+      "color_hex": "2C3E50",
+      "bold": true,
+      "space_before_pt": 9,
+      "space_after_pt": 3,
+      "keep_with_next": true
+    },
+    "code": {
+      "font_name": "Consolas",
+      "font_size_pt": 8.5,
+      "color_hex": "2C3E50",
+      "bg_hex": "F8F9FA",
+      "border_hex": "BDC3C7",
+      "left_bar_hex": "005B7F"
+    }
+  },
+  "palette": {
+    "primary": "#005b7f",
+    "accent": "#00a8cc",
+    "text": "#2c3e50",
+    "muted": "#7f8c8d",
+    "light_bg": "#f8f9fa",
+    "border": "#bdc3c7"
+  },
+  "callouts": {
+    "NOTE": { "bar_hex": "00A8CC", "bg_hex": "F4FBFD", "label_hex": "00A8CC" },
+    "TIP": { "bar_hex": "27AE60", "bg_hex": "F4FAF6", "label_hex": "27AE60" },
+    "WARNING": { "bar_hex": "F39C12", "bg_hex": "FDFCF5", "label_hex": "F39C12" },
+    "DANGER": { "bar_hex": "C0392B", "bg_hex": "FDF7F7", "label_hex": "C0392B" },
+    "OPEN ITEM": { "bar_hex": "8E44AD", "bg_hex": "F9F5FB", "label_hex": "8E44AD" },
+    "EVIDENCE": { "bar_hex": "7F8C8D", "bg_hex": "F7F9FA", "label_hex": "7F8C8D" }
+  },
+  "header_footer": {
+    "header_left": "Logo image width 1.4 inches (or text INSITUMICRON #005B7F)",
+    "header_right": "Short title in Segoe UI 8.5pt #7F8C8D, bottom accent border #00A8CC",
+    "footer_left": "Document version and date in Segoe UI 8.5pt #7F8C8D, top border #BDC3C7",
+    "footer_right": "Page X of Y fields in Segoe UI 8.5pt #7F8C8D"
+  }
+}
